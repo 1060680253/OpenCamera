@@ -1,21 +1,28 @@
 package net.sourceforge.opencamera;
 
-import net.sourceforge.opencamera.CameraController.CameraController;
-import net.sourceforge.opencamera.CameraController.CameraControllerManager2;
-import net.sourceforge.opencamera.Preview.Preview;
-import net.sourceforge.opencamera.UI.FolderChooserDialog;
-import net.sourceforge.opencamera.UI.MainUI;
-
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Hashtable;
-import java.util.List;
-import java.util.Locale;
-import java.util.Map;
-
 import android.Manifest;
+import android.animation.ArgbEvaluator;
+import android.animation.ValueAnimator;
+import android.annotation.SuppressLint;
+import android.annotation.TargetApi;
+import android.app.Activity;
+import android.app.ActivityManager;
+import android.app.AlertDialog;
+import android.app.KeyguardManager;
+import android.bluetooth.BluetoothAssignedNumbers;
+import android.bluetooth.BluetoothHeadset;
+import android.content.ActivityNotFoundException;
+import android.content.BroadcastReceiver;
+import android.content.ContentResolver;
+import android.content.Context;
+import android.content.DialogInterface;
+import android.content.DialogInterface.OnDismissListener;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.content.pm.ActivityInfo;
+import android.content.pm.PackageManager;
+import android.content.res.Configuration;
 import android.graphics.Bitmap;
 import android.graphics.BitmapFactory;
 import android.graphics.Color;
@@ -38,24 +45,6 @@ import android.os.ParcelFileDescriptor;
 import android.os.StatFs;
 import android.preference.PreferenceManager;
 import android.provider.MediaStore;
-import android.animation.ArgbEvaluator;
-import android.animation.ValueAnimator;
-import android.annotation.SuppressLint;
-import android.annotation.TargetApi;
-import android.app.Activity;
-import android.app.ActivityManager;
-import android.app.AlertDialog;
-import android.app.KeyguardManager;
-import android.content.ActivityNotFoundException;
-import android.content.ContentResolver;
-import android.content.Context;
-import android.content.DialogInterface;
-import android.content.DialogInterface.OnDismissListener;
-import android.content.Intent;
-import android.content.SharedPreferences;
-import android.content.pm.ActivityInfo;
-import android.content.pm.PackageManager;
-import android.content.res.Configuration;
 import android.renderscript.RenderScript;
 import android.speech.RecognitionListener;
 import android.speech.RecognizerIntent;
@@ -79,6 +68,21 @@ import android.widget.ImageButton;
 import android.widget.SeekBar;
 import android.widget.SeekBar.OnSeekBarChangeListener;
 import android.widget.ZoomControls;
+
+import net.sourceforge.opencamera.CameraController.CameraController;
+import net.sourceforge.opencamera.CameraController.CameraControllerManager2;
+import net.sourceforge.opencamera.Preview.Preview;
+import net.sourceforge.opencamera.UI.FolderChooserDialog;
+import net.sourceforge.opencamera.UI.MainUI;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Hashtable;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
 
 /** The main Activity for Open Camera.
  */
@@ -114,7 +118,39 @@ public class MainActivity extends Activity implements AudioListener.AudioListene
 	private int audio_noise_sensitivity = -1;
 	private SpeechRecognizer speechRecognizer;
 	private boolean speechRecognizerIsStarted;
-	
+
+	private static final String XEVENT = "+XEVENT";
+
+	private static final int BUTTON_PAYLOAD_LENGTH = 3;
+
+	private static final String BUTTON_TAG = "BUTTON";
+
+	private BroadcastReceiver mShutterReceiver = null;
+
+	///
+	//// Button IDs
+	///
+
+	private static final int POWER_BUTTON_ID = 1;
+
+	private static final int VOLUME_UP_BUTTON_ID = 4;
+
+	private static final int VOLUME_DOWN_BUTTON_ID = 5;
+
+	private static final int CALL_BUTTON_ID = 2;
+
+	private static final int MUTE_MULTI_FUNCTION_BUTTON_ID = 3;
+
+	///
+	//// Button press types
+	///
+
+	private static final int DOUBLE_PRESS_CODE = 5;
+
+	private static final int BUTTON_DOWN_CODE = 1;
+
+	private static final int LONG_PRESS_CODE = 2;
+
 	//private boolean ui_placement_right = true;
 
 	private final ToastBoxer switch_video_toast = new ToastBoxer();
@@ -264,14 +300,14 @@ public class MainActivity extends Activity implements AudioListener.AudioListene
 
 		// set up gallery button long click
         View galleryButton = findViewById(R.id.gallery);
-        galleryButton.setOnLongClickListener(new View.OnLongClickListener() {
+		galleryButton.setOnLongClickListener(new View.OnLongClickListener() {
 			@Override
 			public boolean onLongClick(View v) {
 				//preview.showToast(null, "Long click");
 				longClickedGallery();
 				return true;
 			}
-        });
+		});
 		if( MyDebug.LOG )
 			Log.d(TAG, "onCreate: time after setting gallery long click listener: " + (System.currentTimeMillis() - debug_time));
 
@@ -753,6 +789,13 @@ public class MainActivity extends Activity implements AudioListener.AudioListene
     	loadSound(R.raw.beep);
     	loadSound(R.raw.beep_hi);
 
+		mShutterReceiver = new ShutterTriggerReceiver();
+		IntentFilter filter = new IntentFilter();
+		filter.addAction(BluetoothHeadset.ACTION_VENDOR_SPECIFIC_HEADSET_EVENT);
+		filter.addCategory(BluetoothHeadset.VENDOR_SPECIFIC_HEADSET_EVENT_COMPANY_ID_CATEGORY + "." +
+						   BluetoothAssignedNumbers.PLANTRONICS);
+		registerReceiver(mShutterReceiver, filter);
+
 		mainUI.layoutUI();
 
 		updateGalleryIcon(); // update in case images deleted whilst idle
@@ -816,6 +859,13 @@ public class MainActivity extends Activity implements AudioListener.AudioListene
 			Log.d(TAG, "waitUntilImageQueueEmpty");
         applicationInterface.getImageSaver().waitUntilDone();
     }
+
+	public void receivedTakePhoto() {
+		if (MyDebug.LOG) {
+			Log.d(TAG, "Received take photo intent");
+		}
+		this.takePicture();
+	}
     
     public void clickedTakePhoto(View view) {
 		if( MyDebug.LOG )
@@ -1916,20 +1966,22 @@ public class MainActivity extends Activity implements AudioListener.AudioListene
 		closePopup();
     	this.preview.takePicturePressed();
     }
-    
-    /** Lock the screen - this is Open Camera's own lock to guard against accidental presses,
-     *  not the standard Android lock.
-     */
-    void lockScreen() {
+
+	/**
+	 * Lock the screen - this is Open Camera's own lock to guard against accidental presses,
+	 * not the standard Android lock.
+	 */
+	void lockScreen() {
 		findViewById(R.id.locker).setOnTouchListener(new View.OnTouchListener() {
-            @SuppressLint("ClickableViewAccessibility") @Override
-            public boolean onTouch(View arg0, MotionEvent event) {
-                return gestureDetector.onTouchEvent(event);
-                //return true;
-            }
+			@SuppressLint("ClickableViewAccessibility")
+			@Override
+			public boolean onTouch(View arg0, MotionEvent event) {
+				return gestureDetector.onTouchEvent(event);
+				//return true;
+			}
 		});
 		screen_is_locked = true;
-    }
+	}
 
     /** Unlock the screen (see lockScreen()).
      */
@@ -1982,7 +2034,37 @@ public class MainActivity extends Activity implements AudioListener.AudioListene
 			preview.showToast(screen_locked_toast, R.string.screen_is_locked);
 			return true;
         }
-    }	
+    }
+
+	private class ShutterTriggerReceiver extends BroadcastReceiver {
+
+		@Override
+		public void onReceive(Context context, Intent intent) {
+			if (MyDebug.LOG) {
+				Log.i(TAG, "Received "+intent);
+			}
+			final String action = intent.getAction();
+			if (BluetoothHeadset.ACTION_VENDOR_SPECIFIC_HEADSET_EVENT.equals(action)) {
+				final String command = intent.getStringExtra(BluetoothHeadset.EXTRA_VENDOR_SPECIFIC_HEADSET_EVENT_CMD);
+
+				if (XEVENT.equals(command)) {
+					final Bundle bundle = intent.getExtras();
+					final Object[] payload =
+							(Object[])bundle.get(BluetoothHeadset.EXTRA_VENDOR_SPECIFIC_HEADSET_EVENT_ARGS);
+
+					if (payload.length == BUTTON_PAYLOAD_LENGTH && BUTTON_TAG.equals(payload[0])) {
+						if ((Integer)payload[1] == VOLUME_UP_BUTTON_ID && (Integer)payload[2] == BUTTON_DOWN_CODE) {
+							if (MyDebug.LOG) {
+								Log.d(TAG, "Button ID " + payload[1] + " press " + payload[2]);
+							}
+							receivedTakePhoto();
+						}
+					}
+				}
+			}
+		}
+	}
+
 
 	@Override
 	protected void onSaveInstanceState(Bundle state) {
